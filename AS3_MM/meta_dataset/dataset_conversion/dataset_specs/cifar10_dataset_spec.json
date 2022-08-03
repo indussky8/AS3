@@ -1,0 +1,36 @@
+{
+  "name": "cifar10",
+  "classes_per_split": {
+    "TRAIN": 0,
+    "VALID": 0,
+    "TEST": 10
+  },
+  "images_per_class": {
+    "0": 1000,
+    "1": 1000,
+    "2": 1000,
+    "3": 1000,
+    "4": 1000,
+    "5": 1000,
+    "6": 1000,
+    "7": 1000,
+    "8": 1000,
+    "9": 1000
+  },
+  "class_names": {
+    "0": "airplane",
+    "1": "automobile",
+    "2": "bird",
+    "3": "cat",
+    "4": "deer",
+    "5": "dog",
+    "6": "frog",
+    "7": "horse",
+    "8": "ship",
+    "9": "truck"
+  },
+  "select_class": [],
+  "path": "/mfs/xxzhang/meta-dataset/RECORDS/cifar10",
+  "file_pattern": "{}.tfrecords",
+  "__class__": "DatasetSpecification"
+}

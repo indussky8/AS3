@@ -1,0 +1,237 @@
+import os
+import random
+import torch
+import numpy as np
+from time import time
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+class ConfusionMatrix():
+    def __init__(self, n_classes):
+        self.n_classes = n_classes
+        self.mat = np.zeros([n_classes, n_classes])
+
+    def update_mat(self, preds, labels, idxs):
+        idxs = np.array(idxs)
+        real_pred = idxs[preds]
+        real_labels = idxs[labels]
+        self.mat[real_pred, real_labels] += 1
+
+    def get_mat(self):
+        return self.mat
+
+
+class Accumulator():
+    def __init__(self, max_size=2000):
+        self.max_size = max_size
+        self.ac = np.empty(0)
+
+    def append(self, v):
+        self.ac = np.append(self.ac[-self.max_size:], v)
+
+    def reset(self):
+        self.ac = np.empty(0)
+
+    def mean(self, last=None):
+        last = last if last else self.max_size
+        return self.ac[-last:].mean()
+
+
+class IterBeat():
+    def __init__(self, freq, length=None):
+        self.length = length
+        self.freq = freq
+
+    def step(self, i):
+        if i == 0:
+            self.t = time()
+            self.lastcall = 0
+        else:
+            if ((i % self.freq) == 0) or ((i + 1) == self.length):
+                t = time()
+                print('{0} / {1} ---- {2:.2f} it/sec'.format(
+                    i, self.length, (i - self.lastcall) / (t - self.t)))
+                self.lastcall = i
+                self.t = t
+
+
+class SerializableArray(object):
+    def __init__(self, array):
+        self.shape = array.shape
+        self.data  = array.tobytes()
+        self.dtype = array.dtype
+
+    def get(self):
+        array = np.frombuffer(self.data, self.dtype)
+        return np.reshape(array, self.shape)
+
+
+def print_res(array, name, file=None, prec=4, mult=1):
+    array = np.array(array) * mult
+    mean, std = np.mean(array), np.std(array)
+    conf = 1.96 * std / np.sqrt(len(array))
+    stat_string = ("test {:s}: {:0.%df} +/- {:0.%df}"
+                   % (prec, prec)).format(name, mean, conf)
+    print(stat_string)
+    if file is not None:
+        with open(file, 'a+') as f:
+            f.write(stat_string + '\n')
+
+
+def process_copies(embeddings, labels, args):
+    n_copy = args['test.n_copy']
+    test_embeddings = embeddings.view(
+        args['data.test_query'] * args['data.test_way'],
+        n_copy, -1).mean(dim=1)
+    return test_embeddings, labels[0::n_copy]
+
+
+def set_determ(seed=1234):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def merge_dicts(dicts, torch_stack=True):
+    def stack_fn(l):
+        if isinstance(l[0], torch.Tensor):
+            return torch.stack(l)
+        elif isinstance(l[0], str):
+            return l
+        else:
+            return torch.tensor(l)
+
+    keys = dicts[0].keys()
+    new_dict = {key: [] for key in keys}
+    for key in keys:
+        for d in dicts:
+            new_dict[key].append(d[key])
+    if torch_stack:
+        for key in keys:
+            new_dict[key] = stack_fn(new_dict[key])
+    return new_dict
+
+
+def voting(preds, pref_ind=0):
+    n_models = len(preds)
+    n_test = len(preds[0])
+    final_preds = []
+    for i in range(n_test):
+        cur_preds = [preds[k][i] for k in range(n_models)]
+        classes, counts = np.unique(cur_preds, return_counts=True)
+        if (counts == max(counts)).sum() > 1:
+            final_preds.append(preds[pref_ind][i])
+        else:
+            final_preds.append(classes[np.argmax(counts)])
+    return final_preds
+
+
+def agreement(preds):
+    n_preds = preds.shape[0]
+    mat = np.zeros((n_preds, n_preds))
+    for i in range(n_preds):
+        for j in range(i, n_preds):
+            mat[i, j] = mat[j, i] = (
+                preds[i] == preds[j]).astype('float').mean()
+    return mat
+
+
+def read_textfile(filename, skip_last_line=True):
+    with open(filename, 'r') as f:
+        container = f.read().split('\n')
+        if skip_last_line:
+            container = container[:-1]
+    return container
+
+
+def check_dir(dirname, verbose=True):
+    """This function creates a directory
+    in case it doesn't exist"""
+    try:
+        # Create target Directory
+        os.makedirs(dirname)
+        if verbose:
+            print("Directory ", dirname, " was created")
+    except FileExistsError:
+        if verbose:
+            print("Directory ", dirname, " already exists")
+    return dirname
+
+def wordnet_dist(syn1, syn2, fct='path'):
+    # see https://github.com/nltk/nltk/blob/1805fe870635afb7ef16d4ff5373e1c3d97c9107/nltk/corpus/reader/wordnet.py
+    if fct == 'path':
+        return 1 - syn1.path_similarity(syn2)  # in [0,1]
+    elif fct == 'lch':
+        return -syn1.lch_similarity(syn2)
+    elif fct == 'wup':
+        return -syn1.wup_similarity(syn2)
+    else:
+        fcts = ['path', 'lch', 'wup']
+        raise ValueError(f'Known set of wordnet similarities {fcts}')
+
+def get_dset_class_wordnet_pdist(dset, fct='path'):
+    import wordnet.wordnet_tools  as wnt
+    from   scipy.spatial.distance import squareform
+
+    syns  = [wnt.wnid_to_synset(c.name) for c in dset.classes]
+    m     = len(syns)
+    dists = np.zeros((m * (m - 1)) // 2)
+    k = 0
+    for i in range(0, m - 1):
+        for j in range(i + 1, m):
+            dists[k] = wordnet_dist(syns[i], syns[j], fct=fct)
+            k = k + 1
+    dists = squareform(dists)
+    for i in range(m):
+        dists[i, i] = 1
+    return dists
+
+
+def get_closest_inds_pdist(pdist, take):
+    # closest to each class, evenly, avoids having all classes selected class inds around only one class ... in opposition with using pdist.min(1).sort()
+    # pdist 6000 x 20
+    # return 20 indices among 6000 closest to the 20 classes
+    inds = []; vals = []
+    max_ = pdist.max().item()+1
+    while len(inds) < take:
+        pd = pdist.clone()
+        for x in inds:
+            pd[x] = max_
+        for i in range(pd.size(1)):
+            min_val, (x,y) = get_min(pd)
+            pd[x] = max_
+            pd[:,y] = max_
+            inds.append(x)
+            vals.append(min_val)
+            if len(inds) == take:
+                break
+    return inds, vals
+
+def get_min(pdist):
+    vals, inds = pdist.min(1)
+    val2, ind2 = vals.min(0)
+    val3, ind3 = pdist[ind2].min(0)
+    return val2.item(), (ind2.item(),ind3.item())
+
+def get_class_mean_from_dset_features(features, targets):
+    nclasses = len(set(targets.tolist()))
+    unique_labels = list(set(targets.tolist()))
+    print(set(targets.tolist()))
+    features = torch.nn.functional.normalize(features, dim=1)
+    class_feats = []
+    for i in range(nclasses):
+        label = unique_labels[i]
+        f_i = features[targets==label].mean(0)
+        class_feats.append(f_i)
+    class_feats = torch.stack(class_feats)
+    test_nan(class_feats)
+    return class_feats,unique_labels
+
+
+def test_nan(x):
+    y = torch.isnan(x).float().sum() == 0
+    assert y
+    return y
